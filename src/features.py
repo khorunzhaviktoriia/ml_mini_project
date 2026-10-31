@@ -1,12 +1,29 @@
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
-from src.data_prep import DATA_PATH, TARGET, clean
+from src.data_prep import (
+    DATA_PATH, TARGET, FEATURES, NUMERIC_COLUMNS, CATEGORICAL_FEATURES,
+    UNAVAILABLE_AT_9AM, clean
+)
 
-DIRS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-LAG_COLS = ["Rainfall", "Humidity3pm", "Pressure3pm", "Cloud3pm", "Temp3pm", "WindGustSpeed", "Sunshine", "RainToday"]
-NATIONAL_COLS = ["Humidity3pm", "Pressure3pm", "Rainfall", "Cloud3pm", "WindGustSpeed", "RainToday"]
+if set(FEATURES) & set(UNAVAILABLE_AT_9AM):
+    raise ValueError("Update src/data_prep.py to the 09:00 feature list first")
 
+DIRS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+LAG_COLS = [
+    "Rainfall", "RainToday", "Humidity9am", "Pressure9am",
+    "Humidity3pm", "Pressure3pm", "Cloud3pm", "Temp3pm",
+    "WindGustSpeed", "Sunshine", "MaxTemp",
+]
+LAGS = (1, 2, 3)
+WINDOWS = (3, 7, 14, 30)
 
 COORDS = {
     "Adelaide": (-34.93, 138.60), "Albany": (-35.02, 117.88), "Albury": (-36.08, 146.92),
@@ -27,106 +44,95 @@ COORDS = {
     "Williamtown": (-32.80, 151.84), "Witchcliffe": (-34.03, 115.10), "Wollongong": (-34.43, 150.89),
     "Woomera": (-31.20, 136.82),
 }
-NEIGHBOR_COLS = [
-    "Rainfall", "RainToday", "Humidity3pm", "Pressure3pm", "Cloud3pm", "WindGustSpeed", "PressureDelta",
-    "Rainfall_lag1", "Humidity3pm_lag1", "Pressure3pm_diff1", "Rain_sum3", "Hum_anom7", "Press_anom7",
-    "Sunshine", "Temp3pm",
-]
 
-
-def neighbor_weights(locations):
-    lat = np.radians([COORDS[l][0] for l in locations])
-    lon = np.radians([COORDS[l][1] for l in locations])
-    a = (np.sin((lat[:, None] - lat[None]) / 2) ** 2
-         + np.cos(lat[:, None]) * np.cos(lat[None]) * np.sin((lon[:, None] - lon[None]) / 2) ** 2)
-    dist = 2 * 6371 * np.arcsin(np.sqrt(a))
-    near = np.exp(-(dist / 300) ** 2)
-    west = np.exp(-(dist / 700) ** 2) * (lon[None] < lon[:, None] - 0.01)
-    np.fill_diagonal(near, 0)
-    return near, west
-
-
-def add_neighbor_features(df):
-    locations = sorted(df["Location"].unique())
-    near, west = neighbor_weights(locations)
-    new = []
-    for col in NEIGHBOR_COLS:
-        wide = df.pivot(index="Date", columns="Location", values=col).reindex(columns=locations)
-        vals, mask = np.nan_to_num(wide.to_numpy()), wide.notna().to_numpy().astype(float)
-        for name, w in (("Near", near), ("West", west)):
-            num, den = vals @ w.T, mask @ w.T
-            out = pd.DataFrame(np.where(den > 1e-3, num / np.maximum(den, 1e-9), np.nan),
-                               index=wide.index, columns=locations)
-            new.append(out.stack(future_stack=True).rename(f"{name}_{col}"))
-    new = pd.concat(new, axis=1)
-    new.index.names = ["Date", "Location"]
-    df = df.join(new, on=["Date", "Location"])
-    df["Lat"] = df["Location"].map(lambda l: COORDS[l][0])
-    df["Lon"] = df["Location"].map(lambda l: COORDS[l][1])
-    df["Hum_vsNear"] = df["Humidity3pm"] - df["Near_Humidity3pm"]
-    df["Press_vsNear"] = df["Pressure3pm"] - df["Near_Pressure3pm"]
-    return df
+DERIVED_FEATURES = (
+    ["DoySin", "DoyCos", "Lat", "Lon",
+     "WindDir9amU", "WindDir9amV", "TempHumidityInteraction9am",
+     "PressureTrend18h", "HumidityTrend18h", "TempTrend18h"]
+    + [f"{col}_lag{k}" for col in LAG_COLS for k in LAGS]
+    + [f"{col}_diff1" for col in ("Rainfall", "Humidity9am", "Pressure9am")]
+    + [f"Rain_sum{w}" for w in WINDOWS]
+    + [f"RainDays{w}" for w in WINDOWS]
+    + [f"Hum3pm_mean{w}_prev" for w in WINDOWS]
+    + [f"Press3pm_mean{w}_prev" for w in WINDOWS]
+    + ["DryStreak"]
+)
 
 
 def add_features(df):
-    df = df.sort_values(["Location", "Date"]).reset_index(drop=True)
+    df = df.sort_values(["Location", "Date"]).reset_index(drop=True).copy()
     doy = df["Date"].dt.dayofyear
     df["DoySin"] = np.sin(2 * np.pi * doy / 365.25)
     df["DoyCos"] = np.cos(2 * np.pi * doy / 365.25)
-    df["Year"] = df["Date"].dt.year
+    df["Lat"] = df["Location"].map({k: v[0] for k, v in COORDS.items()})
+    df["Lon"] = df["Location"].map({k: v[1] for k, v in COORDS.items()})
 
-    df["PressureDelta"] = df["Pressure3pm"] - df["Pressure9am"]
-    df["HumidityDelta"] = df["Humidity3pm"] - df["Humidity9am"]
-    df["TempDelta"] = df["Temp3pm"] - df["Temp9am"]
-    df["TempRange"] = df["MaxTemp"] - df["MinTemp"]
-    df["CloudDelta"] = df["Cloud3pm"] - df["Cloud9am"]
-    df["WindDelta"] = df["WindSpeed3pm"] - df["WindSpeed9am"]
-    df["DewGap3pm"] = df["Temp3pm"] * (100 - df["Humidity3pm"]) / 100
-
-    for col in ["WindGustDir", "WindDir9am", "WindDir3pm"]:
-        angle = df[col].map({d: i * np.pi / 8 for i, d in enumerate(DIRS)})
-        df[col + "Sin"] = np.sin(angle)
-        df[col + "Cos"] = np.cos(angle)
-        speed = df["WindGustSpeed"] if col == "WindGustDir" else df["WindSpeed" + col[-3:]]
-        df[col + "U"] = speed * np.sin(angle)
-        df[col + "V"] = speed * np.cos(angle)
+    angle = df["WindDir9am"].map({d: i * np.pi / 8 for i, d in enumerate(DIRS)})
+    df["WindDir9amU"] = df["WindSpeed9am"] * np.sin(angle)
+    df["WindDir9amV"] = df["WindSpeed9am"] * np.cos(angle)
+    df["TempHumidityInteraction9am"] = df["Temp9am"] * df["Humidity9am"]
 
     full = (df.set_index(["Location", "Date"])
               .groupby(level=0, group_keys=False)
-              .apply(lambda g: g.droplevel(0).asfreq("D").assign(Location=g.index[0][0])))
+              .apply(lambda part: part.droplevel(0).asfreq("D").assign(Location=part.index[0][0])))
     full = full.reset_index().set_index(["Location", "Date"])
     g = full.groupby(level=0)
-    new = {}
+    generated = {}
+
     for col in LAG_COLS:
-        for lag in (1, 2, 3):
-            new[f"{col}_lag{lag}"] = g[col].shift(lag)
-        new[f"{col}_diff1"] = full[col] - new[f"{col}_lag1"]
-    for w in (3, 7, 14, 30):
-        new[f"Rain_sum{w}"] = g["Rainfall"].transform(lambda s: s.rolling(w, min_periods=1).sum())
-        new[f"RainDays{w}"] = g["RainToday"].transform(lambda s: s.rolling(w, min_periods=1).mean())
-        new[f"Hum_mean{w}"] = g["Humidity3pm"].transform(lambda s: s.rolling(w, min_periods=1).mean())
-        new[f"Press_mean{w}"] = g["Pressure3pm"].transform(lambda s: s.rolling(w, min_periods=1).mean())
-    dry = full["RainToday"].fillna(0).eq(0)
-    run = dry.groupby(level=0).transform(lambda s: s.groupby((~s).cumsum()).cumsum())
-    new["DryStreak"] = run
-    new = pd.DataFrame(new, index=full.index)
-    new["Hum_anom7"] = full["Humidity3pm"] - new["Hum_mean7"]
-    new["Press_anom7"] = full["Pressure3pm"] - new["Press_mean7"]
-    df = df.join(new, on=["Location", "Date"])
+        for k in LAGS:
+            generated[f"{col}_lag{k}"] = g[col].shift(k)
 
-    nat = df.groupby("Date")[NATIONAL_COLS].agg(["mean", "std"])
-    nat.columns = [f"Nat_{c}_{s}" for c, s in nat.columns]
-    df = df.join(nat, on="Date")
-    for c in ["Humidity3pm", "Pressure3pm"]:
-        df[f"{c}_vsNat"] = df[c] - df[f"Nat_{c}_mean"]
+    for col in ("Rainfall", "Humidity9am", "Pressure9am"):
+        generated[f"{col}_diff1"] = full[col] - generated[f"{col}_lag1"]
 
-    df = add_neighbor_features(df)
+    generated["PressureTrend18h"] = full["Pressure9am"] - generated["Pressure3pm_lag1"]
+    generated["HumidityTrend18h"] = full["Humidity9am"] - generated["Humidity3pm_lag1"]
+    generated["TempTrend18h"] = full["Temp9am"] - generated["Temp3pm_lag1"]
+
+    for w in WINDOWS:
+        generated[f"Rain_sum{w}"] = g["Rainfall"].transform(
+            lambda s: s.rolling(w, min_periods=1).sum())
+        generated[f"RainDays{w}"] = g["RainToday"].transform(
+            lambda s: s.rolling(w, min_periods=1).mean())
+
+
+        for col, stem in (("Humidity3pm", "Hum3pm"),
+                          ("Pressure3pm", "Press3pm")):
+            generated[f"{stem}_mean{w}_prev"] = g[col].transform(
+                lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+
+
+    is_dry = full["RainToday"].eq(0)
+    generated["DryStreak"] = is_dry.groupby(level=0).transform(
+        lambda s: s.groupby((~s).cumsum()).cumsum()
+    ).where(full["RainToday"].notna())
+    df = df.join(pd.DataFrame(generated, index=full.index),
+                 on=["Location", "Date"])
     return df.sort_values(["Date", "Location"]).reset_index(drop=True)
 
 
-def feature_list(df):
-    drop = {"Date", "RainTomorrow", "Year", "HasTarget"}
-    return [c for c in df.columns if c not in drop]
+def feature_list(df=None):
+    return list(FEATURES) + DERIVED_FEATURES
+
+
+def get_feature_x_y(part):
+    return part[feature_list(part)], part[TARGET]
+
+
+def build_feature_preprocessor():
+    return ColumnTransformer([
+        ("numeric_base", SimpleImputer(strategy="median", add_indicator=True),
+         list(NUMERIC_COLUMNS)),
+        ("numeric_derived", SimpleImputer(strategy="median"),
+         DERIVED_FEATURES),
+        ("rain_today", SimpleImputer(strategy="constant", fill_value=0,
+                                     add_indicator=True), ["RainToday"]),
+        ("categorical", Pipeline([
+            ("impute", SimpleImputer(strategy="constant", fill_value="Missing")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), CATEGORICAL_FEATURES),
+    ], sparse_threshold=0)
 
 
 def load_features(path=DATA_PATH):
@@ -134,4 +140,4 @@ def load_features(path=DATA_PATH):
     raw["HasTarget"] = raw[TARGET].notna()
     raw[TARGET] = raw[TARGET].fillna("No")
     df = add_features(clean(raw))
-    return df[df["HasTarget"]].reset_index(drop=True)
+    return df.loc[df["HasTarget"]].drop(columns="HasTarget").reset_index(drop=True)

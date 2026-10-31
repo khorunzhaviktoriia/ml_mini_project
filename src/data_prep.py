@@ -15,12 +15,17 @@ N_FOLDS = 4
 FOLD_DAYS = 365
 
 NUMERIC_COLUMNS = [
-    "MinTemp", "MaxTemp", "Rainfall", "Evaporation", "Sunshine",
-    "WindGustSpeed", "WindSpeed9am", "WindSpeed3pm", "Humidity9am", "Humidity3pm",
-    "Pressure9am", "Pressure3pm", "Cloud9am", "Cloud3pm", "Temp9am", "Temp3pm",
+    "MinTemp", "Rainfall", "Evaporation",
+    "WindSpeed9am", "Humidity9am", "Pressure9am",
+    "Cloud9am", "Temp9am",
 ]
-CATEGORICAL_FEATURES = ["Location", "WindGustDir", "WindDir9am", "WindDir3pm"]
+CATEGORICAL_FEATURES = ["Location", "WindDir9am"]
 FEATURES = NUMERIC_COLUMNS + ["RainToday"] + CATEGORICAL_FEATURES
+
+UNAVAILABLE_AT_9AM = [
+    "MaxTemp", "Sunshine", "WindGustDir", "WindGustSpeed", "WindDir3pm",
+    "WindSpeed3pm", "Humidity3pm", "Pressure3pm", "Cloud3pm", "Temp3pm",
+]
 
 
 def clean(raw, verbose=False):
