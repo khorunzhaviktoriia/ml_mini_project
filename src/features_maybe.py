@@ -1,3 +1,6 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -45,6 +48,24 @@ COORDS = {
     "Woomera": (-31.20, 136.82),
 }
 
+STATION_TZ = {
+    **{s: "Australia/Sydney" for s in [
+        "Albury", "BadgerysCreek", "Cobar", "CoffsHarbour", "Moree", "Newcastle", "NorahHead", "Penrith",
+        "Richmond", "Sydney", "SydneyAirport", "WaggaWagga", "Williamtown", "Wollongong",
+        "Canberra", "Tuggeranong", "MountGinini"]},
+    **{s: "Australia/Melbourne" for s in [
+        "Ballarat", "Bendigo", "Dartmoor", "Melbourne", "MelbourneAirport", "Mildura", "Nhil", "Portland",
+        "Sale", "Watsonia"]},
+    **{s: "Australia/Brisbane" for s in ["Brisbane", "Cairns", "GoldCoast", "Townsville"]},
+    **{s: "Australia/Hobart" for s in ["Hobart", "Launceston"]},
+    **{s: "Australia/Adelaide" for s in ["Adelaide", "MountGambier", "Nuriootpa", "Woomera"]},
+    **{s: "Australia/Darwin" for s in ["AliceSprings", "Darwin", "Katherine", "Uluru"]},
+    **{s: "Australia/Perth" for s in [
+        "Albany", "PearceRAAF", "Perth", "PerthAirport", "SalmonGums", "Walpole", "Witchcliffe"]},
+    "NorfolkIsland": "Pacific/Norfolk",
+}
+assert set(STATION_TZ) == set(COORDS)
+
 NEIGHBOR_COLS = [
     "Rainfall", "RainToday", "Rain_sum3",
     "Humidity9am", "Pressure9am", "Cloud9am", "Temp9am", "WindSpeed9am",
@@ -88,28 +109,69 @@ def neighbor_weights(locations):
     return near, west
 
 
-def weighted_mean(wide, w):
-    vals, mask = np.nan_to_num(wide.to_numpy()), wide.notna().to_numpy().astype(float)
-    num, den = vals @ w.T, mask @ w.T
-    return pd.DataFrame(np.where(den > 1e-3, num / np.maximum(den, 1e-9), np.nan),
-                        index=wide.index, columns=wide.columns)
+def utc_offsets(dates, locations):
+    by_tz = {}
+    for tz in set(STATION_TZ.values()):
+        zone = ZoneInfo(tz)
+        local = [datetime(d.year, d.month, d.day, 9, tzinfo=zone) for d in dates]
+        by_tz[tz] = (np.array([t.utcoffset().total_seconds() / 3600 for t in local]),
+                     np.array([(t.utcoffset() - t.dst()).total_seconds() / 3600 for t in local]))
+    clock = np.column_stack([by_tz[STATION_TZ[l]][0] for l in locations])
+    standard = np.column_stack([by_tz[STATION_TZ[l]][1] for l in locations])
+    return clock, standard
+
+
+def availability(dates, locations):
+    clock, standard = utc_offsets(dates, locations)
+    patterns, inverse = np.unique(np.hstack([clock, standard]), axis=0, return_inverse=True)
+    n = len(locations)
+    masks = [(p[:n][None, :] >= p[:n][:, None]) & (p[n:][None, :] >= p[n:][:, None]) for p in patterns]
+    return masks, inverse.ravel()
+
+
+def spatial_mean(today, yesterday, w, masks, inverse, power=1):
+    out = np.full(today.shape, np.nan)
+    tv, tm = np.nan_to_num(today) ** power, ~np.isnan(today)
+    yv, ym = np.nan_to_num(yesterday) ** power, ~np.isnan(yesterday)
+    for k, avail in enumerate(masks):
+        rows = inverse == k
+        if not rows.any():
+            continue
+        w_now, w_prev = w * avail, w * ~avail
+        num = tv[rows] @ w_now.T + yv[rows] @ w_prev.T
+        den = tm[rows] @ w_now.T + ym[rows] @ w_prev.T
+        out[rows] = np.where(den > 1e-3, num / np.maximum(den, 1e-9), np.nan)
+    return out
 
 
 def add_spatial_features(df):
     locations = sorted(df["Location"].unique())
+    dates = pd.date_range(df["Date"].min(), df["Date"].max(), freq="D")
     near, west = neighbor_weights(locations)
+    everyone = np.ones((len(locations), len(locations)))
+    masks, inverse = availability(dates, locations)
+
+    def wide(col):
+        today = df.pivot(index="Date", columns="Location", values=col).reindex(index=dates, columns=locations)
+        return today.to_numpy(float), today.shift(1).to_numpy(float)
+
+    def long(values, name):
+        return pd.DataFrame(values, index=dates, columns=locations).stack(future_stack=True).rename(name)
+
     new = []
     for col in NEIGHBOR_COLS:
-        wide = df.pivot(index="Date", columns="Location", values=col).reindex(columns=locations)
+        today, yesterday = wide(col)
         for name, w in (("Near", near), ("West", west)):
-            new.append(weighted_mean(wide, w).stack(future_stack=True).rename(f"{name}_{col}"))
+            new.append(long(spatial_mean(today, yesterday, w, masks, inverse), f"{name}_{col}"))
+    for col in NATIONAL_COLS:
+        today, yesterday = wide(col)
+        mean = spatial_mean(today, yesterday, everyone, masks, inverse)
+        square = spatial_mean(today, yesterday, everyone, masks, inverse, power=2)
+        new.append(long(mean, f"Nat_{col}_mean"))
+        new.append(long(np.sqrt(np.clip(square - mean ** 2, 0, None)), f"Nat_{col}_std"))
     new = pd.concat(new, axis=1)
     new.index.names = ["Date", "Location"]
     df = df.join(new, on=["Date", "Location"])
-
-    nat = df.groupby("Date")[NATIONAL_COLS].agg(["mean", "std"])
-    nat.columns = [f"Nat_{c}_{s}" for c, s in nat.columns]
-    df = df.join(nat, on="Date")
 
     for col in ("Humidity9am", "Pressure9am"):
         df[f"{col}_vsNear"] = df[col] - df[f"Near_{col}"]
